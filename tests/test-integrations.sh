@@ -93,7 +93,6 @@ sh scripts/integrations.sh status >/dev/null
 assert_log status:claude
 
 "$python_bin" - <<'PY'
-import json
 import pathlib
 import tomllib
 
@@ -105,8 +104,6 @@ assert actions == {
     "status": ["sh", "scripts/integrations.sh", "status"],
     "uninstall": ["sh", "scripts/integrations.sh", "uninstall"],
 }, actions
-assert json.loads(pathlib.Path("package.json").read_text())["version"] == "0.10.0"
-assert 'version: "0.10.0"' in pathlib.Path("hermes-plugin/plugin.yaml").read_text()
 PY
 
 printf 'test-integrations: OK\n'

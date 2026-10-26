@@ -3,8 +3,7 @@ import net from "node:net";
 const SOURCE = "plugin:herdr-agent-session-title";
 const MAX_TITLE_CHARS = 120;
 const SOCKET_TIMEOUT_MS = 500;
-const TITLE_POLL_INTERVAL_MS = 100;
-const TITLE_POLL_TIMEOUT_MS = 5_000;
+const TITLE_POLL_INTERVAL_MS = 1_000;
 
 export function sanitizeTitle(title) {
   if (typeof title !== "string") return undefined;
@@ -77,57 +76,31 @@ export function renameAgent(title, environment = process.env) {
 }
 
 export default function herdrAgentSessionTitle(pi) {
-  let pendingTitlePoll;
+  let stopTitleWatch = () => {};
 
-  const stopTitlePoll = (ctx) => {
-    if (pendingTitlePoll === undefined) return;
-    ctx.clearTimer(pendingTitlePoll);
-    pendingTitlePoll = undefined;
-  };
-
-  const scheduleTitlePoll = (ctx, previousTitle) => {
+  pi.on("session_start", async (_event, ctx) => {
+    stopTitleWatch();
     if (process.env.HERDR_ENV !== "1") return;
-    stopTitlePoll(ctx);
+    if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
 
-    const deadline = Date.now() + TITLE_POLL_TIMEOUT_MS;
-    const poll = async () => {
-      const title = pi.getSessionName();
-      if (title && title !== previousTitle) {
-        stopTitlePoll(ctx);
-        await renameAgent(title);
-        return;
+    let previousTitle;
+    const synchronizeTitle = async () => {
+      try {
+        const title = pi.getSessionName();
+        if (title && title !== previousTitle && await renameAgent(title)) {
+          previousTitle = title;
+        }
+      } catch {
+        // A title integration must never disturb OMP.
       }
-      if (Date.now() >= deadline) {
-        pendingTitlePoll = undefined;
-        return;
-      }
-      pendingTitlePoll = ctx.setTimeout(poll, TITLE_POLL_INTERVAL_MS);
     };
-    pendingTitlePoll = ctx.setTimeout(poll, TITLE_POLL_INTERVAL_MS);
-  };
 
-  pi.on("input", (event, ctx) => {
-    try {
-      if (/^\/rename(?:\s|$)/.test(event.text.trim())) {
-        scheduleTitlePoll(ctx, pi.getSessionName());
-      }
-    } catch {
-      // Input handling must remain transparent to OMP.
-    }
+    // OMP has no public title-changed event. Observe the public getter for
+    // the session lifetime: title generation and /rename can finish at any time.
+    const timer = ctx.setInterval(synchronizeTitle, TITLE_POLL_INTERVAL_MS);
+    stopTitleWatch = () => ctx.clearTimer(timer);
+    await synchronizeTitle();
   });
 
-  pi.on("session_stop", async (_event, ctx) => {
-    try {
-      if (process.env.HERDR_ENV !== "1") return;
-      const title = pi.getSessionName();
-      if (title) {
-        stopTitlePoll(ctx);
-        await renameAgent(title);
-      } else if (!process.env.PI_NO_TITLE) {
-        scheduleTitlePoll(ctx, undefined);
-      }
-    } catch {
-      // A title integration must never disturb OMP session settlement.
-    }
-  });
+  pi.on("session_shutdown", () => stopTitleWatch());
 }

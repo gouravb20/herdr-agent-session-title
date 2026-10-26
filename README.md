@@ -38,17 +38,17 @@ changes to `~/.codex/config.toml`.
 ### OMP
 
 The OMP integration installs a self-contained package through OMP's plugin
-manager. Its
-extension sends the current OMP session name with `agent.rename`. It observes
-`/rename` input and briefly waits for OMP to persist the explicit name. After a
-completed main-agent turn, it also waits briefly when OMP's generated title is
-still being produced.
+manager. Its extension mirrors the current OMP session name with `agent.rename`,
+including resumed sessions, `/rename`, generated titles, and RPC name changes.
 
-OMP does not currently expose a session-name-changed extension event, so the
-extension uses those two documented lifecycle points instead of OMP internals
-or continuous polling. Task and scout subagent sessions do not rename the
-containing herdr pane. The extension is silent outside herdr and uses a
-0.5-second socket timeout.
+OMP does not currently expose a session-name-changed extension event. The
+extension checks the public session-name API once per second for the lifetime
+of an interactive or RPC session and sends a rename only when the title changes.
+Unlike a short watch after input or turn completion, this also catches slow
+title generation and `/rename` card generation that finish more than five
+seconds later. Task and scout subagent runtimes do not rename the containing
+herdr pane. The extension is silent outside herdr, stops watching on session
+shutdown, and uses a 0.5-second socket timeout.
 
 ### Hermes
 
@@ -71,9 +71,9 @@ format and uses a 0.5-second socket timeout.
 ## Requirements
 
 - herdr >= 0.7.0 (Linux or macOS)
-- Claude Code with custom status-line support, Codex CLI, OMP with
-  `session_stop` extension support, and/or Hermes Agent with plugin hooks
-  (tested with OMP 18.1.2 and Hermes Agent 0.20.6)
+- Claude Code with custom status-line support, Codex CLI, OMP with extension
+  context timers and runtime-mode support, and/or Hermes Agent with plugin hooks
+  (tested with OMP 18.12.6 and Hermes Agent 0.20.6)
 - python3 on PATH
 
 ## Install

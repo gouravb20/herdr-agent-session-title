@@ -16,153 +16,143 @@ assert.equal(normalizeAgentName("123 Über_task!!!\nNext"), "session-123-ber-tas
 assert.equal(normalizeAgentName("x".repeat(80)), "x".repeat(32));
 assert.equal(normalizeAgentName("\u0000\t"), undefined);
 
-let sessionTitle = "";
+const originalEnvironment = Object.fromEntries(
+  ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"].map((key) => [key, process.env[key]]),
+);
+const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-omp-extension-"));
+const requests = [];
+const server = net.createServer((client) => {
+  let input = "";
+  client.setEncoding("utf8");
+  client.on("data", (chunk) => {
+    input += chunk;
+    if (!input.endsWith("\n")) return;
+    requests.push(JSON.parse(input));
+    client.end('{"id":"test","result":{"type":"ok"}}\n');
+  });
+});
+
+// Drive background work with a virtual clock so a late title does not cost
+// seconds of wall time. Socket requests still use the real transport.
+let now = 0;
+let nextTimer = 0;
+const timers = new Map();
+const context = {
+  mode: "tui",
+  setInterval(callback, interval) {
+    const timer = ++nextTimer;
+    timers.set(timer, { callback, interval, due: now + interval });
+    return timer;
+  },
+  setTimeout(callback, interval) {
+    const timer = ++nextTimer;
+    timers.set(timer, { callback, due: now + interval });
+    return timer;
+  },
+  clearTimer(timer) { timers.delete(timer); },
+};
+const advance = async (milliseconds) => {
+  const end = now + milliseconds;
+  while (true) {
+    const entry = [...timers.entries()]
+      .filter(([, timer]) => timer.due <= end)
+      .sort((a, b) => a[1].due - b[1].due)[0];
+    if (!entry) break;
+    const [id, timer] = entry;
+    now = timer.due;
+    if (timer.interval) timer.due += timer.interval;
+    else timers.delete(id);
+    await timer.callback();
+  }
+  now = end;
+};
+let sessionTitle;
 const handlers = new Map();
 extension({
   getSessionName: () => sessionTitle,
   on: (event, handler) => handlers.set(event, handler),
 });
-assert.deepEqual([...handlers.keys()], ["input", "session_stop"]);
-const onInput = handlers.get("input");
-const onSessionStop = handlers.get("session_stop");
-assert.equal(typeof onInput, "function");
-assert.equal(typeof onSessionStop, "function");
-
-const originalEnvironment = {
-  HERDR_ENV: process.env.HERDR_ENV,
-  HERDR_PANE_ID: process.env.HERDR_PANE_ID,
-  HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
-};
-const restoreEnvironment = () => {
-  for (const [name, value] of Object.entries(originalEnvironment)) {
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
-  }
+const emit = async (event, payload = {}) => handlers.get(event)?.(payload, context);
+const expectRename = (name) => {
+  const request = requests.shift();
+  assert.ok(request, `session title ${JSON.stringify(name)} was not synchronized`);
+  assert.equal(request.method, "agent.rename");
+  assert.deepEqual(request.params, { target: "w1:p42", name });
+  assert.match(request.id, /^plugin:herdr-agent-session-title:\d+:\d{6}$/);
+  assert.deepEqual(requests, [], "duplicate rename requests");
 };
 
-const startServer = async (socketPath) => {
-  let resolveRequest;
-  const requestReceived = new Promise((resolve) => {
-    resolveRequest = resolve;
-  });
-  const server = net.createServer((client) => {
-    let input = "";
-    client.setEncoding("utf8");
-    client.on("data", (chunk) => {
-      input += chunk;
-      if (!input.endsWith("\n")) return;
-      resolveRequest(input);
-      client.end('{"id":"test","result":{"type":"ok"}}\n');
-    });
-  });
+try {
+  const socketPath = path.join(tempDirectory, "herdr.sock");
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(socketPath, resolve);
   });
-  return {
-    requestReceived,
-    close: () => new Promise((resolve) => server.close(resolve)),
-  };
-};
-
-const waitForRequest = (request, failureMessage) =>
-  new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(failureMessage)), 2_000);
-    request.then(
-      (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      },
-    );
-  });
-
-const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-omp-extension-"));
-try {
   delete process.env.HERDR_ENV;
-  delete process.env.HERDR_PANE_ID;
-  delete process.env.HERDR_SOCKET_PATH;
   sessionTitle = "outside herdr";
-  await onSessionStop();
+  await emit("session_start");
+  await advance(10_000);
+  assert.deepEqual(requests, []);
 
-  const missingSocket = path.join(tempDirectory, "missing.sock");
-  assert.equal(
-    await renameAgent("socket failure", {
-      HERDR_ENV: "1",
-      HERDR_PANE_ID: "%7",
-      HERDR_SOCKET_PATH: missingSocket,
-    }),
-    false,
-  );
-
-  const socketPath = path.join(tempDirectory, "herdr.sock");
-  const firstServer = await startServer(socketPath);
+  assert.equal(await renameAgent("socket failure", {
+    HERDR_ENV: "1",
+    HERDR_PANE_ID: "w1:p42",
+    HERDR_SOCKET_PATH: path.join(tempDirectory, "missing.sock"),
+  }), false);
 
   process.env.HERDR_ENV = "1";
-  process.env.HERDR_PANE_ID = "%42";
+  process.env.HERDR_PANE_ID = "w1:p42";
   process.env.HERDR_SOCKET_PATH = socketPath;
-  sessionTitle = "123 OMP: Session Title";
-  await onSessionStop();
+  // Task/scout runtimes initialize extensions in print mode.
+  context.mode = "print";
+  sessionTitle = "Subagent title";
+  await emit("session_start");
+  await advance(10_000);
+  assert.deepEqual(requests, [], "subagents must not rename the containing pane");
+  context.mode = "tui";
 
-  const rawRequest = await firstServer.requestReceived;
-  assert.equal(rawRequest.split("\n").length, 2, rawRequest);
-  const request = JSON.parse(rawRequest);
-  assert.equal(request.method, "agent.rename");
-  assert.deepEqual(request.params, {
-    target: "%42",
-    name: "session-123-omp-session-title",
-  });
-  assert.match(request.id, /^plugin:herdr-agent-session-title:\d+:\d{6}$/);
+  // Resumed sessions must synchronize without waiting for another model turn.
+  sessionTitle = "Resumed session";
+  await emit("session_start");
+  expectRename("resumed-session");
+  await advance(10_000);
+  assert.deepEqual(requests, [], "unchanged title must not repeatedly rename");
 
-  await firstServer.close();
+  // No input or session_stop event accompanies an RPC title change.
+  sessionTitle = "RPC rename";
+  await advance(1_000);
+  expectRename("rpc-rename");
 
-  const delayedSocketPath = path.join(tempDirectory, "herdr-delayed.sock");
-  const delayedServer = await startServer(delayedSocketPath);
-  process.env.HERDR_SOCKET_PATH = delayedSocketPath;
-  sessionTitle = "";
-  const timerContext = {
-    setTimeout: (callback, delay) => setTimeout(callback, delay),
-    clearTimer: (timer) => clearTimeout(timer),
-  };
-  await onSessionStop(undefined, timerContext);
-  setTimeout(() => {
-    sessionTitle = "Generated after session stop";
-  }, 150);
+  // A new session can stay unnamed longer than the old five-second deadline.
+  sessionTitle = undefined;
+  await emit("session_start");
+  await emit("session_stop");
+  await advance(30_000);
+  assert.deepEqual(requests, []);
+  sessionTitle = "Late generated title";
+  await advance(1_000);
+  expectRename("late-generated-title");
 
-  const delayedRawRequest = await waitForRequest(
-    delayedServer.requestReceived,
-    "generated title was not synchronized",
-  );
-  assert.deepEqual(JSON.parse(delayedRawRequest).params, {
-    target: "%42",
-    name: "generated-after-session-stop",
-  });
-  await delayedServer.close();
+  await emit("input", { text: "/rename Slow manual rename" });
+  await advance(30_000);
+  sessionTitle = "Slow manual rename";
+  await advance(1_000);
+  expectRename("slow-manual-rename");
 
-  const renameSocketPath = path.join(tempDirectory, "herdr-rename.sock");
-  const renameServer = await startServer(renameSocketPath);
-  process.env.HERDR_SOCKET_PATH = renameSocketPath;
-  sessionTitle = "Old title";
-  await onInput({ text: "/rename Manual OMP Name" }, timerContext);
-  setTimeout(() => {
-    sessionTitle = "Manual OMP Name";
-  }, 150);
-
-  const renameRawRequest = await waitForRequest(
-    renameServer.requestReceived,
-    "/rename title was not synchronized",
-  );
-  assert.deepEqual(JSON.parse(renameRawRequest).params, {
-    target: "%42",
-    name: "manual-omp-name",
-  });
-  await renameServer.close();
+  // Switching sessions resets deduplication, even if their titles match.
+  await emit("session_start");
+  expectRename("slow-manual-rename");
+  await emit("session_shutdown");
+  sessionTitle = "After shutdown";
+  await advance(10_000);
+  assert.deepEqual(requests, []);
 } finally {
-  restoreEnvironment();
+  timers.clear();
+  for (const [name, value] of Object.entries(originalEnvironment)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  await new Promise((resolve) => server.close(resolve));
   fs.rmSync(tempDirectory, { recursive: true, force: true });
 }
-
 console.log("test-omp-extension: OK");
